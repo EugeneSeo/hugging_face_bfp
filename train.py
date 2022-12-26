@@ -2,6 +2,7 @@ import argparse
 import os
 import time
 import warnings
+import json
 
 import torch
 from transformers import *
@@ -10,8 +11,13 @@ import random
 import numpy as np
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-
+from evaluate import load
 # from transformers.src.transformers.bfp_training.util.bfp.bfp_config import BfpConfig
+
+class AttrDict(dict):
+    def __init__(self, *args, **kwargs):
+        super(AttrDict, self).__init__(*args, **kwargs)
+        self.__dict__ = self
 
 def set_reproducibility(random_seed):
     # set random number seeds
@@ -29,6 +35,70 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % (2**32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+def get_project_name(args):
+    config = args.config
+    if config.use_bfp and config.bfp_M_Bit is None:
+        raise ValueError(f"in BFP training, mantissa bits must be set")
+
+    arch = config.architectures[0]
+    if config.use_bfp:
+        if config.PrecisionFlag == 0:
+            data_format = f"fp_m{config.bfp_M_Bit}"
+        else:
+            data_format = f"bfp_m{config.bfp_M_Bit}"
+    else:
+        data_format = "fp32"
+
+    model_info = f"{arch}-{data_format}"
+
+    lr = f"lr{args.learning_rate}"
+    adam_info = f"adam-{lr}"
+
+    dataset_type = args.dataset_type
+    batch_size = f"global_batch{args.batch_size}"
+    is_dist = "multi_gpus" if args.multiprocessing_distributed else "single_gpu"
+    dataset_info = f"{dataset_type}-{batch_size}-{is_dist}"
+
+    if args.seed is None:
+        seed_info = "no_seed"
+    else:
+        seed_info = f"seed{args.seed}"
+
+    if config.use_bfp:
+        if config.use_flex_bfp and config.is_fast:
+            raise ValueError("options Flex BFP and FAST cannot be set at the same time")
+
+    if config.use_flex_bfp:
+        bfp_info = "-flex-bfp"
+    elif config.is_fast:
+        bfp_info = "-fast"
+    else:
+        bfp_info = ""
+
+    st_info = f"st_{'f' if config.f_st else ''}{'w' if config.w_st else ''}{'a' if config.a_st else ''}"
+
+    if not config.use_bfp:
+        st_info = "no_st"
+
+    thres_info = f"thres_{'f' if config.f_thres else ''}{'w' if config.w_thres else ''}{'a' if config.a_thres else ''}{config.threshold}"
+
+    if (config.f_thres == False and config.w_thres == False and config.a_thres == False) or not config.use_bfp:
+        thres_info = "no_thres"
+
+    if config.use_multi_exp:
+        if config.threshold:
+            if config.use_shift:
+                multi_exp_info = f"multi_exp_shifted_thres{config.threshold}-"
+            else:
+                multi_exp_info = f"multi_exp_thres{config.threshold}-"
+        else:
+            raise ValueError(f"must set threshold for supporting multi exponent")
+    else:
+        multi_exp_info = ""
+    group_size = config.group_size
+
+    return f"{multi_exp_info}{st_info}-{thres_info}-{model_info}-{adam_info}-{dataset_info}-{seed_info}{bfp_info}-g{group_size}-epochs{args.training_epochs}"
 
 def train(gpu, ngpus_per_node, args):
     if args.seed is not None:
@@ -95,19 +165,17 @@ def train(gpu, ngpus_per_node, args):
                                   pin_memory=True, 
                                   drop_last=True,)
     optimizer = torch.optim.AdamW(model.parameters(), lr = args.learning_rate)
-    # optimizer = torch.optim.Adam(model.parameters(), lr = args.learning_rate, eps = 1e-8 )
     softmax = torch.nn.Softmax(dim=1)
     loss_func = torch.nn.CrossEntropyLoss().cuda(args.gpu)
+    glue_metric = load('glue', args.dataset_type)
 
     model.train()
     step = 0
-    training_time = 0
 
-    if not os.path.exists(args.save_path):
-        os.mkdir(args.save_path)
+    # if not os.path.exists(args.save_path):
+    #     os.mkdir(args.save_path)
     # BfpConfig.use_bfp = False if args.precision_flag == 0 else True
 
-    # max_len = 0
     initiated = False
     for epoch in range(args.training_epochs):
         with open(args.log_path, "a") as f:
@@ -116,111 +184,116 @@ def train(gpu, ngpus_per_node, args):
         if args.distributed:
             train_dist_sampler.set_epoch(epoch)
 
-        end = time.time()
+        # end = time.time()
+        # max_length = 0
         for i, batch in enumerate(train_dataloader): # batch: 'sentence', 'label', 'idx'
             # Tokenize the sentence and get the model output
-            # batch['sentence'] = ["[CLS]" + str(sentence) + "[SEP]" for sentence in batch['sentence']]
             inputs = tokenizer(batch['sentence'], padding=args.pad_option, max_length=args.max_length, truncation=True, return_tensors="pt")
-            # print(inputs)
-            # print(batch['sentence'])
-            # if inputs['input_ids'].shape[1] > max_len:
-            #     max_len = inputs['input_ids'].shape[1]
-            # continue
+            # print(inputs['input_ids'].shape)
+            # if max_length < inputs['input_ids'].shape[1]:
+            #     max_length = inputs['input_ids'].shape[1]
+            # if step > 0:
+            #     continue
             if (args.gpu is not None) or torch.cuda.is_available():
                 outputs = model(inputs['input_ids'].cuda(args.gpu, non_blocking=True), inputs['attention_mask'].cuda(args.gpu, non_blocking=True), inputs['token_type_ids'].cuda(args.gpu, non_blocking=True), labels=batch['label'].cuda(args.gpu, non_blocking=True))
-                # inputs = inputs.cuda(args.gpu)
-                # outputs = model(**inputs)
             else:
-                outputs = model(inputs['input_ids'], inputs['token_type_ids'], inputs['attention_mask'], labels=batch['label'])
+                outputs = model(inputs['input_ids'], inputs['attention_mask'], inputs['token_type_ids'], labels=batch['label'])
 
             if not initiated:
                 initiated = True
                 continue
             # Update the model
-            # loss = outputs[0].view(1, 1, -1)
-
-            # loss = outputs.loss
-            # print(outputs)
-            loss = loss_func(outputs.logits, batch['label'].cuda(args.gpu, non_blocking=True))
+            # loss = loss_func(outputs.logits, batch['label'].cuda(args.gpu, non_blocking=True))
+            loss = outputs[0].view(1, 1, -1)
             loss_item = loss.item()
-
+            prediction = torch.argmax(softmax(outputs[1].detach()), dim=1).type(torch.int8).cpu()
+            reference = batch['label'].detach().type(torch.int8)
+            # count = len(batch['label'])
+            # correct = len(batch['label']) - torch.count_nonzero(torch.argmax(softmax(outputs[1]), dim=1).detach().cpu() - batch['label'])            
+            TP = torch.sum(torch.bitwise_and(prediction, reference)).detach() # (Pred, Ref) = (1, 1)
+            TN = torch.sum(torch.bitwise_and(1 - prediction, 1 - reference)).detach() # (Pred, Ref) = (0, 0)
+            FP = torch.sum(torch.bitwise_and(prediction, 1 - reference)).detach() # (Pred, Ref) = (1, 0)
+            FN = torch.sum(torch.bitwise_and(1 - prediction, reference)).detach() # (Pred, Ref) = (0, 1)
+            prediction = prediction.tolist()
+            reference = reference.tolist()
+            
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            # optimizer.zero_grad()
-            print("one step done")
-
-            training_time += time.time() - end
-            end = time.time()
 
             if step % args.stdout_interval == 0:
                 with open(args.log_path, "a") as f:
-                    f.write("[Step {0:<4}] Train loss: {1}\n".format(step, loss_item))
+                    result = glue_metric.compute(predictions=prediction, references=reference)
+                    # f.write("[Step {0:<4}] Train loss: {1}, Metric: {2}, Accuracy: {3}\n".format(step, loss_item, result, correct / count))
+                    f.write("[Step {0}] Train loss: {1}, Metric: {2}, Accuracy: {3}, TP: {4}, TN: {5}, FP: {6}, FN: {7}\n".format(step, loss_item, result, (TP+TN)/(TP+TN+FP+FN), TP, TN, FP, FN))
             if step % args.validation_interval == 0: # and step != 0:
                 model.eval()
-                # val_max_len = 0
                 with torch.no_grad():
                     validation_loss = []
+                    predictions = []
+                    references = []
                     correct = 0
                     count = 0
-                    
+                    TP = 0
+                    TN = 0
+                    FP = 0
+                    FN = 0
+                    # max_len_val = 0
                     for v_batch in validation_dataloader:
-                        # print(v_batch)
                         inputs = tokenizer(v_batch['sentence'], padding=args.pad_option, max_length=args.max_length, truncation=True, return_tensors="pt")
-                        # print("train.py:", inputs['input_ids'].shape, inputs['attention_mask'].shape)
-                        # if inputs['input_ids'].shape[1] > val_max_len:
-                        #     val_max_len = inputs['input_ids'].shape[1]
-                        # continue
                         if (args.gpu is not None) or torch.cuda.is_available():
                             outputs = model(inputs['input_ids'].cuda(args.gpu, non_blocking=True), inputs['attention_mask'].cuda(args.gpu, non_blocking=True), inputs['token_type_ids'].cuda(args.gpu, non_blocking=True), labels=v_batch['label'].cuda(args.gpu, non_blocking=True))
                         else:
                             outputs = model(inputs['input_ids'], inputs['attention_mask'],  inputs['token_type_ids'], labels=v_batch['label'])
                         validation_loss.append(outputs[0].item())
-                        count += len(v_batch['label'])
-                        correct += len(v_batch['label']) - torch.count_nonzero(torch.argmax(softmax(outputs[1]), dim=1).cpu() - v_batch['label'])
+                        # if max_len_val < inputs['input_ids'].shape[1]:
+                        #     max_len_val = inputs['input_ids'].shape[1]
+                        # count += len(v_batch['label'])
+                        # correct += len(v_batch['label']) - torch.count_nonzero(torch.argmax(softmax(outputs[1]), dim=1).cpu() - v_batch['label'])
+                        # predictions = predictions + torch.argmax(softmax(outputs[1]), dim=1).cpu().tolist()
+                        # references = references + v_batch['label'].tolist()
+                        prediction = torch.argmax(softmax(outputs[1].detach()), dim=1).type(torch.int8).cpu()
+                        reference = v_batch['label'].detach().type(torch.int8)           
+                        TP += torch.sum(torch.bitwise_and(prediction, reference)).detach() # (Pred, Ref) = (1, 1)
+                        TN += torch.sum(torch.bitwise_and(1 - prediction, 1 - reference)).detach() # (Pred, Ref) = (0, 0)
+                        FP += torch.sum(torch.bitwise_and(prediction, 1 - reference)).detach() # (Pred, Ref) = (1, 0)
+                        FN += torch.sum(torch.bitwise_and(1 - prediction, reference)).detach() # (Pred, Ref) = (0, 1)
+                        predictions = predictions + prediction.tolist()
+                        references = references + reference.tolist()
+                    # print(max_len_val)
                     with open(args.log_path, "a") as f:
-                        f.write("[Step {0:<4}] Validation loss: {1}, Accuracy: {2}\n".format(step, sum(validation_loss) / len(validation_loss), correct / count))
-                # if step == 0:
-                #     print(val_max_len)
+                        results = glue_metric.compute(predictions=predictions, references=references)
+                        # f.write("[Step {0:<4}] Validation loss: {1}, Metric: {2}, Accuracy: {3}\n".format(step, sum(validation_loss) / len(validation_loss), results, correct / count))
+                        f.write("[Step {0}] Validation loss: {1}, Metric: {2}, Accuracy: {3}, TP: {4}, TN: {5}, FP: {6}, FN: {7}\n".format(step, sum(validation_loss) / len(validation_loss), results, (TP+TN)/(TP+TN+FP+FN), TP, TN, FP, FN))
                 model.train()
-            if step % args.checkpoint_interval == 0 and step != 0:
-                checkpoint_path = "{}/model_{:08d}.pt".format(args.save_path, step)
-                if args.distributed:
-                    torch.save({'model_state_dict': model.module.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict()}, checkpoint_path)
-                else:
-                    torch.save({'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict()}, checkpoint_path)
 
             step += 1
-            # if step > 100:
-            #     break
-        # if epoch == 0:
-        #     print(max_len)
-        # scheduler.step()
+        # print(max_length)
+        # return
     with open(args.log_path, "a") as f:
-        f.write("\n\n[Training Time] total: {0}, average (time per step): {1}".format(training_time, training_time / step))
+        f.write("\n\n--- Training Finished ---\n")
 
 if __name__=="__main__":
     print('Initializing Training Process..')
 
     parser = argparse.ArgumentParser()
     
-    parser.add_argument('--save_path', default='./exp_default')
-    parser.add_argument('--log-path', default='./log.txt')
+    # parser.add_argument('--save_path', default='./exp_default')
+    # parser.add_argument('--log-path', default='./log.txt')
     parser.add_argument('--pretrained-name', default="bert-base-uncased")
+    # parser.add_argument('--pretrained-name', default="bert-large-uncased")
     parser.add_argument('--dataset-type', default='cola') # Current code is supports only CoLA!
     parser.add_argument('--config_path', default='./config.json')
 
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N', help='number of data loading workers (default: 4)')
     parser.add_argument('--batch_size', default=32, type=int)
-    parser.add_argument('--learning_rate', default=2e-5, type=float)
+    parser.add_argument('--learning_rate', default=1e-5, type=float)
     # parser.add_argument('--learning_rate', default=2e-6, type=int)
     parser.add_argument('--pad-option', default='longest', help="longest or max_length") 
     parser.add_argument('--max-length', default=None, type=int) 
     parser.add_argument('--training_epochs', default=5, type=int)
     parser.add_argument('--stdout_interval', default=50, type=int)
-    parser.add_argument('--checkpoint_interval', default=200, type=int)
+    # parser.add_argument('--checkpoint_interval', default=200, type=int)
     # parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument('--validation_interval', default=200, type=int)
 
@@ -238,6 +311,12 @@ if __name__=="__main__":
 
     args = parser.parse_args()
 
+    with open(args.config_path) as f:
+        data = f.read()
+        config = json.loads(data)
+        config = AttrDict(config)
+        args.config = config
+
     if args.seed is not None:
         set_reproducibility(args.seed) # need to import later
         warnings.warn('You have chosen to seed training. '
@@ -251,6 +330,8 @@ if __name__=="__main__":
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
+    # print(get_project_name(args))
+    args.log_path = "./logs_bert_base_uncased/{}.txt".format(get_project_name(args))
     ngpus_per_node = torch.cuda.device_count()
     if args.multiprocessing_distributed:
         mp.spawn(train, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
