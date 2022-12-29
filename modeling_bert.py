@@ -360,8 +360,8 @@ class BertSelfAttention(nn.Module):
         else: 
             # attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
             # shape_spec = query_layer.shape
-            key_layer = key_layer.transpose(-1, -2)
-            # key_layer = torch.Tensor(np.transpose(key_layer.cpu().detach().numpy(), [0, 1, 3, 2]).copy()).to(key_layer.device)
+            # key_layer = key_layer.transpose(-1, -2)
+            key_layer = torch.Tensor(np.transpose(key_layer.cpu().detach().numpy(), [0, 1, 3, 2]).copy()).to(key_layer.device)
             if self.matmul_1 is None:
                 self.matmul_1 = CustomMatMul(query_layer.shape, key_layer.shape, True, self.config.use_multi_exp, False, self.config.threshold, self.config)
             # attention_scores = self.matmul_1.run(query_layer, key_layer).view(shape_spec[0], shape_spec[1], shape_spec[2], -1)
