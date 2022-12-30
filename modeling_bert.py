@@ -299,7 +299,11 @@ class BertSelfAttention(nn.Module):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(new_x_shape)
         # return x.permute(0, 2, 1, 3)
-        return torch.Tensor(np.transpose(x.cpu().detach().numpy(), [0, 2, 1, 3]).copy()).to(x.device)
+        x = x.permute(0, 2, 1, 3)
+        return x.contiguous()
+        # return torch.empty_like(x).copy_(x)
+        # return torch.tensor.new_tensor(x, requires_grad=True)
+        # return torch.Tensor(np.transpose(x.cpu().detach().numpy(), [0, 2, 1, 3]).copy()).to(x.device)
 
     def forward(
         self,
@@ -359,9 +363,11 @@ class BertSelfAttention(nn.Module):
             #     NPY_SAVE += 1
         else: 
             # attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-            # shape_spec = query_layer.shape
             # key_layer = key_layer.transpose(-1, -2)
-            key_layer = torch.Tensor(np.transpose(key_layer.cpu().detach().numpy(), [0, 1, 3, 2]).copy()).to(key_layer.device)
+            key_layer = key_layer.transpose(-1, -2).contiguous()
+            # key_layer = torch.empty_like(key_layer).copy_(key_layer)
+            # key_layer = torch.tensor.new_tensor(key_layer, requires_grad=True)
+            # key_layer = torch.Tensor(np.transpose(key_layer.cpu().detach().numpy(), [0, 1, 3, 2]).copy()).to(key_layer.device)
             if self.matmul_1 is None:
                 self.matmul_1 = CustomMatMul(query_layer.shape, key_layer.shape, True, self.config.use_multi_exp, False, self.config.threshold, self.config)
             # attention_scores = self.matmul_1.run(query_layer, key_layer).view(shape_spec[0], shape_spec[1], shape_spec[2], -1)
