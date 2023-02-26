@@ -1,1 +1,0 @@
-python3 train.py --seed 1024 --gpu 0 --pad-option max_length --max-length 128 --config_path ./config/bert/config_bfp.json --save_path ./exp_bfp --log-path ./log_train_bfp.txt

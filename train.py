@@ -10,9 +10,7 @@ from datasets import load_dataset, load_metric
 import random
 import numpy as np
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from evaluate import load
-# from transformers.src.transformers.bfp_training.util.bfp.bfp_config import BfpConfig
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -53,11 +51,12 @@ def get_project_name(args):
     model_info = f"{arch}-{data_format}"
 
     lr = f"lr{args.learning_rate}"
-    adam_info = f"adam-{lr}"
+    optim_info = f"sgd_{lr}"
 
     dataset_type = args.dataset_type
     batch_size = f"global_batch{args.batch_size}"
-    is_dist = "multi_gpus" if args.multiprocessing_distributed else "single_gpu"
+    # is_dist = "multi_gpus" if args.multiprocessing_distributed else "single_gpu"
+    is_dist = "single_gpu"
     dataset_info = f"{dataset_type}-{batch_size}-{is_dist}"
 
     if args.seed is None:
@@ -98,57 +97,30 @@ def get_project_name(args):
         multi_exp_info = ""
     group_size = config.group_size
 
-    return f"{multi_exp_info}{st_info}-{thres_info}-{model_info}-{adam_info}-{dataset_info}-{seed_info}{bfp_info}-g{group_size}-epochs{args.training_epochs}"
+    return f"{multi_exp_info}{st_info}-{thres_info}-{model_info}-{optim_info}-{dataset_info}-{seed_info}{bfp_info}-g{group_size}-epochs{args.training_epochs}"
 
-def train(gpu, ngpus_per_node, args):
+def train(gpu, args):
     if args.seed is not None:
-        set_reproducibility(args.seed) # need to import later
+        set_reproducibility(args.seed) 
 
     args.gpu = gpu
     print('Use GPU: {} for training'.format(args.gpu))
-    if args.distributed:
-        if args.dist_url == "env://" and args.rank == -1:
-            args.rank = int(os.environ["RANK"])
-        if args.multiprocessing_distributed:
-            # For multiprocessing distributed training, rank needs to be the global rank among all the processes
-            args.rank = args.rank * ngpus_per_node + gpu
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url, world_size=args.distributed, rank=args.rank)
-    # device = torch.device('cuda:{:d}'.format(args.rank))
-
+    
     tokenizer = BertTokenizer.from_pretrained(args.pretrained_name)
-    # model = BertForSequenceClassification.from_pretrained(args.pretrained_name, config=args.config_path, num_labels = 2, 
-    #                                                     problem_type = "single_label_classification")
     model = BertForSequenceClassification.from_pretrained(args.pretrained_name, config=args.config_path, num_labels = 2,)
 
-    if args.distributed:
-        if args.gpu is not None:
-            torch.cuda.set_device(args.gpu)
-            model.cuda(args.gpu)
-            # When using a single GPU per process and per DistributedDataParallel, 
-            # we need to divide the batch size ourselves based on the total number of GPUs of the current node.
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        else:
-            model.cuda()
-            # DistributedDataParallel will divide and allocate batch_size to all available GPUs if device_ids are not set
-            model = torch.nn.parallel.DistributedDataParallel(model)
-    elif args.gpu is not None:
+    if args.gpu is not None:
         torch.cuda.set_device(args.gpu)
         model = model.cuda(args.gpu)
     else:
         print("It is recommended to use GPU for Transformer training!!")
         # DataParallel will divide and allocate batch_size to all available GPUs
         model = torch.nn.DataParallel(model).cuda()
-    dist_but_rank_0 = args.multiprocessing_distributed and args.rank % ngpus_per_node == 0
 
     # Prepare Dataset & Model
     train_dataset = load_dataset("glue", args.dataset_type, split="train")
     validation_dataset = load_dataset("glue", args.dataset_type, split="validation")
-    if args.distributed:
-        train_dist_sampler = DistributedSampler(train_data)
-    else:
-        train_dist_sampler = None
+    train_dist_sampler = None
     train_dataloader = DataLoader(train_dataset, 
                                   batch_size=args.batch_size, 
                                   shuffle=(train_dist_sampler is None), 
@@ -164,52 +136,30 @@ def train(gpu, ngpus_per_node, args):
                                   num_workers=args.workers, 
                                   pin_memory=True, 
                                   drop_last=True,)
-    optimizer = torch.optim.AdamW(model.parameters(), lr = args.learning_rate)
+    
+    optimizer = torch.optim.SGD(model.parameters(), lr = args.learning_rate, momentum=0.9)
     softmax = torch.nn.Softmax(dim=1)
-    loss_func = torch.nn.CrossEntropyLoss().cuda(args.gpu)
     glue_metric = load('glue', args.dataset_type)
 
     model.train()
     step = 0
-
-    # if not os.path.exists(args.save_path):
-    #     os.mkdir(args.save_path)
-    # BfpConfig.use_bfp = False if args.precision_flag == 0 else True
-
-    initiated = False
     for epoch in range(args.training_epochs):
         with open(args.log_path, "a") as f:
             f.write("\n=== Epoch {} ===\n".format(epoch))
-        
-        if args.distributed:
-            train_dist_sampler.set_epoch(epoch)
 
-        # end = time.time()
-        # max_length = 0
         for i, batch in enumerate(train_dataloader): # batch: 'sentence', 'label', 'idx'
             # Tokenize the sentence and get the model output
             inputs = tokenizer(batch['sentence'], padding=args.pad_option, max_length=args.max_length, truncation=True, return_tensors="pt")
-            # print(inputs['input_ids'].shape)
-            # if max_length < inputs['input_ids'].shape[1]:
-            #     max_length = inputs['input_ids'].shape[1]
-            # if step > 0:
-            #     continue
             if (args.gpu is not None) or torch.cuda.is_available():
                 outputs = model(inputs['input_ids'].cuda(args.gpu, non_blocking=True), inputs['attention_mask'].cuda(args.gpu, non_blocking=True), inputs['token_type_ids'].cuda(args.gpu, non_blocking=True), labels=batch['label'].cuda(args.gpu, non_blocking=True))
             else:
                 outputs = model(inputs['input_ids'], inputs['attention_mask'], inputs['token_type_ids'], labels=batch['label'])
 
-            if not initiated:
-                initiated = True
-                continue
             # Update the model
-            # loss = loss_func(outputs.logits, batch['label'].cuda(args.gpu, non_blocking=True))
             loss = outputs[0].view(1, 1, -1)
             loss_item = loss.item()
             prediction = torch.argmax(softmax(outputs[1].detach()), dim=1).type(torch.int8).cpu()
-            reference = batch['label'].detach().type(torch.int8)
-            # count = len(batch['label'])
-            # correct = len(batch['label']) - torch.count_nonzero(torch.argmax(softmax(outputs[1]), dim=1).detach().cpu() - batch['label'])            
+            reference = batch['label'].detach().type(torch.int8)            
             TP = torch.sum(torch.bitwise_and(prediction, reference)).detach() # (Pred, Ref) = (1, 1)
             TN = torch.sum(torch.bitwise_and(1 - prediction, 1 - reference)).detach() # (Pred, Ref) = (0, 0)
             FP = torch.sum(torch.bitwise_and(prediction, 1 - reference)).detach() # (Pred, Ref) = (1, 0)
@@ -224,7 +174,6 @@ def train(gpu, ngpus_per_node, args):
             if step % args.stdout_interval == 0:
                 with open(args.log_path, "a") as f:
                     result = glue_metric.compute(predictions=prediction, references=reference)
-                    # f.write("[Step {0:<4}] Train loss: {1}, Metric: {2}, Accuracy: {3}\n".format(step, loss_item, result, correct / count))
                     f.write("[Step {0}] Train loss: {1}, Metric: {2}, Accuracy: {3}, TP: {4}, TN: {5}, FP: {6}, FN: {7}\n".format(step, loss_item, result, (TP+TN)/(TP+TN+FP+FN), TP, TN, FP, FN))
             if step % args.validation_interval == 0: # and step != 0:
                 model.eval()
@@ -238,7 +187,7 @@ def train(gpu, ngpus_per_node, args):
                     TN = 0
                     FP = 0
                     FN = 0
-                    # max_len_val = 0
+                    
                     for v_batch in validation_dataloader:
                         inputs = tokenizer(v_batch['sentence'], padding=args.pad_option, max_length=args.max_length, truncation=True, return_tensors="pt")
                         if (args.gpu is not None) or torch.cuda.is_available():
@@ -246,12 +195,7 @@ def train(gpu, ngpus_per_node, args):
                         else:
                             outputs = model(inputs['input_ids'], inputs['attention_mask'],  inputs['token_type_ids'], labels=v_batch['label'])
                         validation_loss.append(outputs[0].item())
-                        # if max_len_val < inputs['input_ids'].shape[1]:
-                        #     max_len_val = inputs['input_ids'].shape[1]
-                        # count += len(v_batch['label'])
-                        # correct += len(v_batch['label']) - torch.count_nonzero(torch.argmax(softmax(outputs[1]), dim=1).cpu() - v_batch['label'])
-                        # predictions = predictions + torch.argmax(softmax(outputs[1]), dim=1).cpu().tolist()
-                        # references = references + v_batch['label'].tolist()
+                        
                         prediction = torch.argmax(softmax(outputs[1].detach()), dim=1).type(torch.int8).cpu()
                         reference = v_batch['label'].detach().type(torch.int8)           
                         TP += torch.sum(torch.bitwise_and(prediction, reference)).detach() # (Pred, Ref) = (1, 1)
@@ -260,54 +204,38 @@ def train(gpu, ngpus_per_node, args):
                         FN += torch.sum(torch.bitwise_and(1 - prediction, reference)).detach() # (Pred, Ref) = (0, 1)
                         predictions = predictions + prediction.tolist()
                         references = references + reference.tolist()
-                    # print(max_len_val)
+                    
                     with open(args.log_path, "a") as f:
                         results = glue_metric.compute(predictions=predictions, references=references)
-                        # f.write("[Step {0:<4}] Validation loss: {1}, Metric: {2}, Accuracy: {3}\n".format(step, sum(validation_loss) / len(validation_loss), results, correct / count))
                         f.write("[Step {0}] Validation loss: {1}, Metric: {2}, Accuracy: {3}, TP: {4}, TN: {5}, FP: {6}, FN: {7}\n".format(step, sum(validation_loss) / len(validation_loss), results, (TP+TN)/(TP+TN+FP+FN), TP, TN, FP, FN))
                 model.train()
 
             step += 1
-        # print(max_length)
-        # return
+
     with open(args.log_path, "a") as f:
         f.write("\n\n--- Training Finished ---\n")
+
 
 if __name__=="__main__":
     print('Initializing Training Process..')
 
     parser = argparse.ArgumentParser()
     
-    # parser.add_argument('--save_path', default='./exp_default')
-    # parser.add_argument('--log-path', default='./log.txt')
     parser.add_argument('--pretrained-name', default="bert-base-uncased")
-    # parser.add_argument('--pretrained-name', default="bert-large-uncased")
-    parser.add_argument('--dataset-type', default='cola') # Current code is supports only CoLA!
+    parser.add_argument('--dataset-type', default='cola') 
     parser.add_argument('--config_path', default='./config.json')
 
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N', help='number of data loading workers (default: 4)')
     parser.add_argument('--batch_size', default=32, type=int)
     parser.add_argument('--learning_rate', default=1e-5, type=float)
-    # parser.add_argument('--learning_rate', default=2e-6, type=int)
     parser.add_argument('--pad-option', default='longest', help="longest or max_length") 
     parser.add_argument('--max-length', default=None, type=int) 
     parser.add_argument('--training_epochs', default=5, type=int)
     parser.add_argument('--stdout_interval', default=50, type=int)
-    # parser.add_argument('--checkpoint_interval', default=200, type=int)
-    # parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument('--validation_interval', default=200, type=int)
 
-    parser.add_argument('--dist-url', default="tcp://127.0.0.1:5712", type=str, help='url used to set up distributed training')
-    parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
-    parser.add_argument('--world-size', default=-1, type=int, help='number of nodes for distributed training')
-    parser.add_argument('--rank', default=-1, type=int, help='node rank for distributed training')
     parser.add_argument('--seed', default=None, type=int, help='seed for initializing training. ')
     parser.add_argument('--gpu', default=None, type=int, help='GPU id to use.')
-    parser.add_argument('--multiprocessing-distributed', action='store_true',
-                    help='Use multi-processing distributed training to launch '
-                         'N processes per node, which has N GPUs. This is the '
-                         'fastest way to use PyTorch for either single node or '
-                         'multi node data parallel training')
 
     args = parser.parse_args()
 
@@ -325,15 +253,8 @@ if __name__=="__main__":
                       'You may see unexpected behavior when restarting '
                       'from checkpoints.')
 
-    if args.dist_url == "env://" and args.world_size == -1:
-        args.world_size = int(os.environ["WORLD_SIZE"])
-
-    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
-
-    # print(get_project_name(args))
-    args.log_path = "./logs_bert_base_uncased/{}.txt".format(get_project_name(args))
-    ngpus_per_node = torch.cuda.device_count()
-    if args.multiprocessing_distributed:
-        mp.spawn(train, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
-    else:
-        train(args.gpu, ngpus_per_node, args)
+    save_path = "./logs_{}/".format(args.pretrained_name.split('/')[-1])
+    if not os.path.exists(save_path):
+        os.makedirs(save_path) 
+    args.log_path = save_path + "{}.txt".format(get_project_name(args))
+    train(args.gpu, args)

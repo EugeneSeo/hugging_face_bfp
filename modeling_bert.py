@@ -50,15 +50,13 @@ from ...utils import (
     replace_return_docstrings,
 )
 from .configuration_bert import BertConfig
-# from ...bfp_training.util.custom_linear import CustomLinear
-# from ...bfp_training.util.custom_matmul import CustomMatMul
+############ NEW ############
 from ...bfp_training.util.custom_linear import CustomLinear
-from ...bfp_training.util.custom_matmul import CustomMatMul
-# from ...bfp_training.util.bfp.bfp_config import BfpConfig
+from ...bfp_training.util.new_custom_matmul import CustomMatMul
 
 import numpy as np
 GLOBAL_ID = 0
-NPY_SAVE = 0
+#############################
 
 logger = logging.get_logger(__name__)
 
@@ -261,16 +259,20 @@ class BertSelfAttention(nn.Module):
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
+        ############ NEW ############
         if config.use_bfp == False:
             self.query = nn.Linear(config.hidden_size, self.all_head_size)
             self.key = nn.Linear(config.hidden_size, self.all_head_size)
             self.value = nn.Linear(config.hidden_size, self.all_head_size)
+            self.global_id = None
         else: 
             global GLOBAL_ID
-            self.query = CustomLinear(config.hidden_size, self.all_head_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
-            self.key = CustomLinear(config.hidden_size, self.all_head_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID+1, config=config)
-            self.value = CustomLinear(config.hidden_size, self.all_head_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID+2, config=config)
+            self.query = CustomLinear(config.hidden_size, self.all_head_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID)
+            self.key = CustomLinear(config.hidden_size, self.all_head_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID+1)
+            self.value = CustomLinear(config.hidden_size, self.all_head_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID+2)
+            self.global_id = GLOBAL_ID + 3
             GLOBAL_ID += 3
+        #############################
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.position_embedding_type = position_embedding_type or getattr(
@@ -281,29 +283,23 @@ class BertSelfAttention(nn.Module):
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
 
         self.is_decoder = config.is_decoder
+        ############ NEW ############
         if config.use_bfp == False:
             self.matmul = torch.matmul
         else: 
             self.matmul = None
-            # self.matmul = torch.matmul
-        B = 1
-        # torch.Size([B, 12, 256, 64]) torch.Size([B, 12, 64, 256])
+            self.global_id = GLOBAL_ID
+            GLOBAL_ID += 2
         self.matmul_1 = None
-        # self.matmul_1 = CustomMatMul(torch.Size([B, 12, 256, 64]), torch.Size([B, 12, 64, 256]), True, config.use_multi_exp, False, config.threshold, config)
-        # torch.Size([1, 12, 256, 256]) torch.Size([1, 12, 256, 64])
         self.matmul_2 = None
-        # self.matmul_2 = CustomMatMul(torch.Size([B, 12, 256, 256]), torch.Size([B, 12, 256, 64]), True, config.use_multi_exp, False, config.threshold, config)
         self.config = config
+        #############################
 
     def transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(new_x_shape)
         # return x.permute(0, 2, 1, 3)
-        x = x.permute(0, 2, 1, 3)
-        return x.contiguous()
-        # return torch.empty_like(x).copy_(x)
-        # return torch.tensor.new_tensor(x, requires_grad=True)
-        # return torch.Tensor(np.transpose(x.cpu().detach().numpy(), [0, 2, 1, 3]).copy()).to(x.device)
+        return x.permute(0, 2, 1, 3).contiguous() #### NEW: Added .contiguous() method ####
 
     def forward(
         self,
@@ -315,7 +311,7 @@ class BertSelfAttention(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
-        mixed_query_layer = self.query(hidden_states)
+        mixed_query_layer = self.query(hidden_states.contiguous()) #### NEW: Added .contiguous() method ####
 
         # If this is instantiated as a cross-attention module, the keys
         # and values come from an encoder; the attention mask needs to be
@@ -328,20 +324,21 @@ class BertSelfAttention(nn.Module):
             value_layer = past_key_value[1]
             attention_mask = encoder_attention_mask
         elif is_cross_attention:
-            key_layer = self.transpose_for_scores(self.key(encoder_hidden_states))
-            value_layer = self.transpose_for_scores(self.value(encoder_hidden_states))
+            key_layer = self.transpose_for_scores(self.key(encoder_hidden_states.contiguous()))     #### NEW: Added .contiguous() method ####
+            value_layer = self.transpose_for_scores(self.value(encoder_hidden_states.contiguous())) #### NEW: Added .contiguous() method ####
             attention_mask = encoder_attention_mask
         elif past_key_value is not None:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
+            key_layer = self.transpose_for_scores(self.key(hidden_states.contiguous()))     #### NEW: Added .contiguous() method ####
+            value_layer = self.transpose_for_scores(self.value(hidden_states.contiguous())) #### NEW: Added .contiguous() method ####
             key_layer = torch.cat([past_key_value[0], key_layer], dim=2)
             value_layer = torch.cat([past_key_value[1], value_layer], dim=2)
         else:
-            key_layer = self.transpose_for_scores(self.key(hidden_states))
-            value_layer = self.transpose_for_scores(self.value(hidden_states))
+            key_layer = self.transpose_for_scores(self.key(hidden_states.contiguous()))     #### NEW: Added .contiguous() method ####
+            value_layer = self.transpose_for_scores(self.value(hidden_states.contiguous())) #### NEW: Added .contiguous() method ####
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
+        use_cache = past_key_value is not None
         if self.is_decoder:
             # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
             # Further calls to cross_attention layer can then reuse all cross-attention
@@ -351,43 +348,30 @@ class BertSelfAttention(nn.Module):
             # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
             # if encoder bi-directional self-attention `past_key_value` is always `None`
             past_key_value = (key_layer, value_layer)
-        # global NPY_SAVE
+
         # Take the dot product between "query" and "key" to get the raw attention scores.
         # attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        ############ NEW ############
         if self.matmul is not None:
             attention_scores = self.matmul(query_layer, key_layer.transpose(-1, -2))
-            # if NPY_SAVE < 10:
-            #     np.save("/home/egseo/hugging_face/matmul_npy/{}_lhs.npy".format(NPY_SAVE), query_layer.cpu().detach().numpy())
-            #     np.save("/home/egseo/hugging_face/matmul_npy/{}_rhs.npy".format(NPY_SAVE), key_layer.transpose(-1, -2).cpu().detach().numpy())
-            #     np.save("/home/egseo/hugging_face/matmul_npy/{}_output.npy".format(NPY_SAVE), attention_scores.cpu().detach().numpy())
-            #     NPY_SAVE += 1
         else: 
-            # attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-            # key_layer = key_layer.transpose(-1, -2)
-            key_layer = key_layer.transpose(-1, -2).contiguous()
-            # key_layer = torch.empty_like(key_layer).copy_(key_layer)
-            # key_layer = torch.tensor.new_tensor(key_layer, requires_grad=True)
-            # key_layer = torch.Tensor(np.transpose(key_layer.cpu().detach().numpy(), [0, 1, 3, 2]).copy()).to(key_layer.device)
+            key_layer = key_layer.transpose(-1, -2)
             if self.matmul_1 is None:
-                self.matmul_1 = CustomMatMul(query_layer.shape, key_layer.shape, True, self.config.use_multi_exp, False, self.config.threshold, self.config)
-            # attention_scores = self.matmul_1.run(query_layer, key_layer).view(shape_spec[0], shape_spec[1], shape_spec[2], -1)
-            attention_scores = self.matmul_1.run(query_layer, key_layer)
-            print(query_layer.shape, key_layer.shape, attention_scores.shape)
-            # # print("matmul1 error: ", torch.mean(torch.abs(attention_scores - torch.matmul(query_layer, key_layer))))
-        # [PROBLEM - SOLVED] 
-        '''
-            torch.matmul: supports (..., M, K) * (..., K, N) -> (..., M, N)
-            BfpGemm: supports (M, K) * (K, N) -> (M, N)
-
-            Method1: (B, H, L, F) * (B, H, F, L) -> (B*H*L, F) * (F, B*H*L) -> (B*H*L, B*H*L) ?? 
-            Method2: ??
-        '''
+                self.matmul_1 = CustomMatMul(query_layer.shape, key_layer.shape, self.config.PrecisionFlag, self.global_id, self.config.use_multi_exp, False, self.config.threshold, self.config)
+            attention_scores = self.matmul_1(query_layer.contiguous(), key_layer.contiguous())
+        #############################
 
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            seq_length = hidden_states.size()[1]
-            position_ids_l = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            position_ids_r = torch.arange(seq_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
+            query_length, key_length = query_layer.shape[2], key_layer.shape[2]
+            if use_cache:
+                position_ids_l = torch.tensor(key_length - 1, dtype=torch.long, device=hidden_states.device).view(
+                    -1, 1
+                )
+            else:
+                position_ids_l = torch.arange(query_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
+            position_ids_r = torch.arange(key_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
             distance = position_ids_l - position_ids_r
+
             positional_embedding = self.distance_embedding(distance + self.max_position_embeddings - 1)
             positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
 
@@ -416,37 +400,15 @@ class BertSelfAttention(nn.Module):
             attention_probs = attention_probs * head_mask
 
         # context_layer = torch.matmul(attention_probs, value_layer)
-        # if self.matmul_2 is None:
-        #     self.matmul_2 = BfpGemm(attention_probs.shape, value_layer.transpose(-1, -2).shape, _USE_STOCHASTIC_ROUNDING, _USE_FLEX_BFP)
-        # context_layer = self.matmul_2.run(attention_probs, value_layer.transpose(-1, -2))
+        ############ NEW ############
         if self.matmul is not None:
             context_layer = self.matmul(attention_probs, value_layer)
-            
-            # if NPY_SAVE < 10:
-            #     np.save("/home/egseo/hugging_face/matmul_npy/{}_lhs.npy".format(NPY_SAVE), attention_probs.cpu().detach().numpy())
-            #     np.save("/home/egseo/hugging_face/matmul_npy/{}_rhs.npy".format(NPY_SAVE), value_layer.cpu().detach().numpy())
-            #     np.save("/home/egseo/hugging_face/matmul_npy/{}_output.npy".format(NPY_SAVE), context_layer.cpu().detach().numpy())
-            #     NPY_SAVE += 1
         else: 
-            # # context_layer = torch.matmul(attention_probs, value_layer)
-            # # shape_spec = attention_probs.shape
             if self.matmul_2 is None:
-                # print(attention_probs.shape, value_layer.shape)
-                self.matmul_2 = CustomMatMul(attention_probs.shape, value_layer.shape, True, self.config.use_multi_exp, False, self.config.threshold, self.config)
-            # # context_layer = self.matmul_2.run(attention_probs, value_layer).view(shape_spec[0], shape_spec[1], shape_spec[2], -1)
-            # self.matmul_2 = CustomMatMul(attention_probs.shape, value_layer.shape, True, False, False, 100)
-            # value_layer = torch.randn(size=value_layer.shape, dtype=torch.float).to(value_layer.device) * 5
-            context_layer = self.matmul_2.run(attention_probs, value_layer)
-            print(attention_probs.shape, value_layer.shape, context_layer.shape)
-            # print("matmul2 error: ", torch.mean(torch.abs(context_layer - torch.matmul(attention_probs, value_layer))))
-            # fp_outputs = torch.matmul(attention_probs, value_layer)
-            # outputs_cuda = context_layer
-            # diff_cuda = torch.abs(fp_outputs.flatten() - outputs_cuda.flatten())
-            # errors = torch.abs((outputs_cuda - fp_outputs) / (fp_outputs + 1e-15)) * 100.
+                self.matmul_2 = CustomMatMul(attention_probs.shape, value_layer.shape, self.config.PrecisionFlag, self.global_id + 1, self.config.use_multi_exp, False, self.config.threshold, self.config)
+            context_layer = self.matmul_2(attention_probs.contiguous(), value_layer.contiguous())
+        #############################
 
-            # print(f"avg error mean  : {torch.mean(errors.flatten()).item():.2f}")
-            # print(f"[diffs]\nmean: {torch.mean(diff_cuda):.15f}\nmax:  {torch.max(diff_cuda):.15f}\nmin:  {torch.min(diff_cuda):.15f}")
-        # print(attention_probs.shape, value_layer.shape, context_layer.shape)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(new_context_layer_shape)
@@ -461,17 +423,20 @@ class BertSelfAttention(nn.Module):
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        ############ NEW ############
         if config.use_bfp == False:
             self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         else:
             global GLOBAL_ID
             self.dense = CustomLinear(config.hidden_size, config.hidden_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dense(hidden_states.contiguous()) #### NEW: Added .contiguous() method ####
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -529,19 +494,22 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        ############ NEW ############
         if config.use_bfp == False:
             self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         else:
             global GLOBAL_ID
             self.dense = CustomLinear(config.hidden_size, config.intermediate_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dense(hidden_states.contiguous()) #### NEW: Added .contiguous() method ####
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
 
@@ -549,17 +517,20 @@ class BertIntermediate(nn.Module):
 class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        ############ NEW ############
         if config.use_bfp == False:
             self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
         else:
             global GLOBAL_ID
             self.dense = CustomLinear(config.intermediate_size, config.hidden_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dense(hidden_states.contiguous()) #### NEW: Added .contiguous() method ####
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
@@ -751,19 +722,22 @@ class BertEncoder(nn.Module):
 class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        ############ NEW ############
         if config.use_bfp == False:
             self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         else:        
             global GLOBAL_ID
             self.dense = CustomLinear(config.hidden_size, config.hidden_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # We "pool" the model by simply taking the hidden state corresponding
         # to the first token.
         first_token_tensor = hidden_states[:, 0]
-        pooled_output = self.dense(first_token_tensor)
+        pooled_output = self.dense(first_token_tensor.contiguous()) #### NEW: Added .contiguous() method ####
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
@@ -771,12 +745,15 @@ class BertPooler(nn.Module):
 class BertPredictionHeadTransform(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        ############ NEW ############
         if config.use_bfp == False:
             self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         else:
             global GLOBAL_ID
             self.dense = CustomLinear(config.hidden_size, config.hidden_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
         if isinstance(config.hidden_act, str):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -784,7 +761,7 @@ class BertPredictionHeadTransform(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
+        hidden_states = self.dense(hidden_states.contiguous()) #### NEW: Added .contiguous() method ####
         hidden_states = self.transform_act_fn(hidden_states)
         hidden_states = self.LayerNorm(hidden_states)
         return hidden_states
@@ -797,13 +774,15 @@ class BertLMPredictionHead(nn.Module):
 
         # The output weights are the same as the input embeddings, but there is
         # an output-only bias for each token.
+        # self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        ############ NEW ############
         if config.use_bfp == False:
             self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         else:
             global GLOBAL_ID
             self.decoder = CustomLinear(config.hidden_size, config.vocab_size, bias=False, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
-
+        #############################
         self.bias = nn.Parameter(torch.zeros(config.vocab_size))
 
         # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
@@ -811,7 +790,7 @@ class BertLMPredictionHead(nn.Module):
 
     def forward(self, hidden_states):
         hidden_states = self.transform(hidden_states)
-        hidden_states = self.decoder(hidden_states)
+        hidden_states = self.decoder(hidden_states.contiguous()) #### NEW: Added .contiguous() method ####
         return hidden_states
 
 
@@ -828,15 +807,18 @@ class BertOnlyMLMHead(nn.Module):
 class BertOnlyNSPHead(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # self.seq_relationship = nn.Linear(config.hidden_size, 2)
+        ############ NEW ############
         if config.use_bfp == False:
             self.seq_relationship = nn.Linear(config.hidden_size, 2)
         else:
             global GLOBAL_ID
             self.seq_relationship = CustomLinear(config.hidden_size, 2, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
 
     def forward(self, pooled_output):
-        seq_relationship_score = self.seq_relationship(pooled_output)
+        seq_relationship_score = self.seq_relationship(pooled_output.contiguous()) #### NEW: Added .contiguous() method ####
         return seq_relationship_score
 
 
@@ -844,16 +826,19 @@ class BertPreTrainingHeads(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.predictions = BertLMPredictionHead(config)
+        # self.seq_relationship = nn.Linear(config.hidden_size, 2)
+        ############ NEW ############
         if config.use_bfp == False:
             self.seq_relationship = nn.Linear(config.hidden_size, 2)
         else:
             global GLOBAL_ID
-            self.seq_relationship = CustomLinear(config.hidden_size, config.vocab_size, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
+            self.seq_relationship = CustomLinear(config.hidden_size, 2, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
 
     def forward(self, sequence_output, pooled_output):
         prediction_scores = self.predictions(sequence_output)
-        seq_relationship_score = self.seq_relationship(pooled_output)
+        seq_relationship_score = self.seq_relationship(pooled_output.contiguous()) #### NEW: Added .contiguous() method ####
         return prediction_scores, seq_relationship_score
 
 
@@ -877,12 +862,12 @@ class BertPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
-        elif isinstance(module, CustomLinear):
-            # Slightly different from the TF version which uses truncated_normal for initialization
-            # cf https://github.com/pytorch/pytorch/pull/5617
+        ############ NEW ############
+        if isinstance(module, CustomLinear):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
                 module.bias.data.zero_()
+        #############################
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
@@ -1184,6 +1169,8 @@ class BertModel(BertPreTrainedModel):
     BERT_START_DOCSTRING,
 )
 class BertForPreTraining(BertPreTrainedModel):
+    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias", r"cls.predictions.decoder.weight"]
+
     def __init__(self, config):
         super().__init__(config)
 
@@ -1290,7 +1277,7 @@ class BertForPreTraining(BertPreTrainedModel):
 class BertLMHeadModel(BertPreTrainedModel):
 
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
-    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
+    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias", r"cls.predictions.decoder.weight"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1402,7 +1389,7 @@ class BertLMHeadModel(BertPreTrainedModel):
             cross_attentions=outputs.cross_attentions,
         )
 
-    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, **model_kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past=None, attention_mask=None, use_cache=True, **model_kwargs):
         input_shape = input_ids.shape
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
         if attention_mask is None:
@@ -1412,7 +1399,12 @@ class BertLMHeadModel(BertPreTrainedModel):
         if past is not None:
             input_ids = input_ids[:, -1:]
 
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "past_key_values": past}
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "past_key_values": past,
+            "use_cache": use_cache,
+        }
 
     def _reorder_cache(self, past, beam_idx):
         reordered_past = ()
@@ -1425,7 +1417,7 @@ class BertLMHeadModel(BertPreTrainedModel):
 class BertForMaskedLM(BertPreTrainedModel):
 
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
-    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
+    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias", r"cls.predictions.decoder.weight"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1651,17 +1643,18 @@ class BertForSequenceClassification(BertPreTrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(classifier_dropout)
+        # self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        ############ NEW ############
         if config.use_bfp == False:
             self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         else:
             global GLOBAL_ID
             self.classifier = CustomLinear(config.hidden_size, config.num_labels, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
 
         # Initialize weights and apply final processing
         self.post_init()
-
-        # BfpConfig.bfp_M_Bit = 4
 
     @add_start_docstrings_to_model_forward(BERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
@@ -1708,7 +1701,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         pooled_output = outputs[1]
 
         pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
+        logits = self.classifier(pooled_output.contiguous()) #### NEW: Added .contiguous() method ####
 
         loss = None
         if labels is not None:
@@ -1760,12 +1753,15 @@ class BertForMultipleChoice(BertPreTrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(classifier_dropout)
+        # self.classifier = nn.Linear(config.hidden_size, 1)
+        ############ NEW ############
         if config.use_bfp == False:
             self.classifier = nn.Linear(config.hidden_size, 1)
         else:
             global GLOBAL_ID
             self.classifier = CustomLinear(config.hidden_size, 1, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1824,7 +1820,7 @@ class BertForMultipleChoice(BertPreTrainedModel):
         pooled_output = outputs[1]
 
         pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
+        logits = self.classifier(pooled_output.contiguous()) #### NEW: Added .contiguous() method ####
         reshaped_logits = logits.view(-1, num_choices)
 
         loss = None
@@ -1864,12 +1860,15 @@ class BertForTokenClassification(BertPreTrainedModel):
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(classifier_dropout)
+        # self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+        ############ NEW ############
         if config.use_bfp == False:
             self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         else:
             global GLOBAL_ID
             self.classifier = CustomLinear(config.hidden_size, config.num_labels, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1917,7 +1916,7 @@ class BertForTokenClassification(BertPreTrainedModel):
         sequence_output = outputs[0]
 
         sequence_output = self.dropout(sequence_output)
-        logits = self.classifier(sequence_output)
+        logits = self.classifier(sequence_output.contiguous()) #### NEW: Added .contiguous() method ####
 
         loss = None
         if labels is not None:
@@ -1952,12 +1951,15 @@ class BertForQuestionAnswering(BertPreTrainedModel):
         self.num_labels = config.num_labels
 
         self.bert = BertModel(config, add_pooling_layer=False)
+        # self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
+        ############ NEW ############
         if config.use_bfp == False:
             self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
         else:
             global GLOBAL_ID
             self.qa_outputs = CustomLinear(config.hidden_size, config.num_labels, bias=True, precision_flag=config.PrecisionFlag, global_id=GLOBAL_ID, config=config)
             GLOBAL_ID += 1
+        #############################
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -2013,7 +2015,7 @@ class BertForQuestionAnswering(BertPreTrainedModel):
 
         sequence_output = outputs[0]
 
-        logits = self.qa_outputs(sequence_output)
+        logits = self.qa_outputs(sequence_output.contiguous()) #### NEW: Added .contiguous() method ####
         start_logits, end_logits = logits.split(1, dim=-1)
         start_logits = start_logits.squeeze(-1).contiguous()
         end_logits = end_logits.squeeze(-1).contiguous()

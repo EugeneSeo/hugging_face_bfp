@@ -26,8 +26,7 @@ class LinearFunction(torch.autograd.Function):
         bfp_gemms, 
         intermediate_memory, 
         id,
-        global_id,
-        config = None
+        global_id
         ):
         if precision_flag == PrecisionFlag.FP:
             prec_name = "fp"
@@ -44,47 +43,27 @@ class LinearFunction(torch.autograd.Function):
         ctx.global_id = global_id
         ctx.prec_name = prec_name
 
-        Config = config if config is not None else BfpConfig
-        if config is not None:
-            BfpConfig.use_bfp = config.use_bfp
-            BfpConfig.use_flex_bfp = config.use_flex_bfp
-            BfpConfig.use_multi_exp = config.use_multi_exp
-            BfpConfig.group_size = config.group_size
-            BfpConfig.bfp_M_Bit = config.bfp_M_Bit
-            BfpConfig.thread_num = config.thread_num
-            BfpConfig.is_fast = config.is_fast
-            BfpConfig.f_st = config.f_st
-            BfpConfig.a_st = config.a_st 
-            BfpConfig.w_st = config.w_st
-            BfpConfig.threshold = config.threshold
-            BfpConfig.f_thres = config.f_thres
-            BfpConfig.a_thres = config.a_thres
-            BfpConfig.w_thres = config.w_thres
-            BfpConfig.use_shift = config.use_shift
-
-        ctx.config = Config
-
         if precision_flag == PrecisionFlag.FP:
             outputs = torch.matmul(inputs, weights.t())
 
         elif precision_flag == PrecisionFlag.BFP:
             if bfp_gemms["fwd"] is None:
-                if Config.is_fast:
+                if BfpConfig.is_fast:
                     bfp_gemms["fwd"] = FastBfpGemm(
                         inputs.shape,
                         weights.shape,
-                        use_stochastic_rounding=Config.f_st,
-                        use_flex_bfp=Config.use_flex_bfp,
+                        use_stochastic_rounding=BfpConfig.f_st,
+                        use_flex_bfp=BfpConfig.use_flex_bfp,
                         layer_index=global_id,
                         name=f"linear-{id}-fwd")
                 else:
                     bfp_gemms["fwd"] = BfpGemm(
                         inputs.shape,
                         weights.shape,
-                        use_stochastic_rounding=Config.f_st,
-                        use_multi_exp=Config.use_multi_exp,
-                        apply_thresholding=Config.f_thres,
-                        threshold=Config.threshold)
+                        use_stochastic_rounding=BfpConfig.f_st,
+                        use_multi_exp=BfpConfig.use_multi_exp,
+                        apply_thresholding=BfpConfig.f_thres,
+                        threshold=BfpConfig.threshold)
 
             bfp_gemm = bfp_gemms["fwd"]
             outputs = bfp_gemm.run(inputs, weights)
@@ -96,11 +75,11 @@ class LinearFunction(torch.autograd.Function):
             #     with open(f"{BfpConfig.log_path}/fwd-{global_id}-W.npy", "wb") as f:
             #         np.save(f, weights.cpu().clone().detach().numpy(), allow_pickle=False)
 
-            if Config.should_log:
-                with open(f"{Config.log_path}/fwd-{global_id}-A.npy", "wb") as f:
+            if BfpConfig.should_log:
+                with open(f"{BfpConfig.log_path}/fwd-{global_id}-A.npy", "wb") as f:
                     np.save(f, inputs.cpu().clone().detach().numpy(), allow_pickle=False)
 
-                with open(f"{Config.log_path}/fwd-{global_id}-W.npy", "wb") as f:
+                with open(f"{BfpConfig.log_path}/fwd-{global_id}-W.npy", "wb") as f:
                     np.save(f, weights.cpu().clone().detach().numpy(), allow_pickle=False)
 
 
@@ -123,8 +102,6 @@ class LinearFunction(torch.autograd.Function):
         prec_name = ctx.prec_name
         grad_input = grad_weight = grad_bias = None
 
-        Config = ctx.config
-
         if ctx.needs_input_grad[0]:
             if precision_flag == PrecisionFlag.FP:
                 grad_input = torch.matmul(grad_output, weight)
@@ -137,34 +114,34 @@ class LinearFunction(torch.autograd.Function):
                         device="cuda"
                     )
                 weight_t = intermediate_memory["weight-t"]
-                custom_transpose_2d(dst=weight_t, src=weight)
+                custom_transpose_2d(dst=weight_t, src=weight.contiguous())
 
                 if bfp_gemms["grad-a"] is None:
-                    if Config.is_fast:
+                    if BfpConfig.is_fast:
                         bfp_gemms["grad-a"] = FastBfpGemm(
                             grad_output.shape,
                             weight_t.shape,
-                            use_stochastic_rounding=Config.a_st,
-                            use_flex_bfp=Config.use_flex_bfp,
+                            use_stochastic_rounding=BfpConfig.a_st,
+                            use_flex_bfp=BfpConfig.use_flex_bfp,
                             layer_index=global_id,
                             name=f"linear-{id}-grad-a")
                     else:
                         bfp_gemms["grad-a"] = BfpGemm(
                             grad_output.shape,
                             weight_t.shape,
-                            use_stochastic_rounding=Config.a_st,
-                            use_multi_exp=Config.use_multi_exp,
-                            apply_thresholding=Config.a_thres,
-                            threshold=Config.threshold)
+                            use_stochastic_rounding=BfpConfig.a_st,
+                            use_multi_exp=BfpConfig.use_multi_exp,
+                            apply_thresholding=BfpConfig.a_thres,
+                            threshold=BfpConfig.threshold)
 
                 bfp_gemm = bfp_gemms["grad-a"]
-                grad_input = bfp_gemm.run(grad_output, weight_t)
+                grad_input = bfp_gemm.run(grad_output.contiguous(), weight_t)
 
                 # if BfpConfig.should_log:
                 #     with open(f"{BfpConfig.log_path}/bwd-{global_id}-dA.npy", "wb") as f:
                 #         np.save(f, grad_input.cpu().clone().detach().numpy(), allow_pickle=False)
-                if Config.should_log:
-                    with open(f"{Config.log_path}/bwd-{global_id}-dA.npy", "wb") as f:
+                if BfpConfig.should_log:
+                    with open(f"{BfpConfig.log_path}/bwd-{global_id}-dA.npy", "wb") as f:
                         np.save(f, grad_input.cpu().clone().detach().numpy(), allow_pickle=False)
 
             else:
@@ -204,7 +181,7 @@ class LinearFunction(torch.autograd.Function):
                         device="cuda"
                     )
                 grad_output_t = intermediate_memory["grad-output-t"]
-                custom_transpose_2d(dst=grad_output_t, src=grad_output)
+                custom_transpose_2d(dst=grad_output_t, src=grad_output.contiguous())
                 
                 if intermediate_memory["input-t"] is None:
                     intermediate_memory["input-t"] = torch.empty(
@@ -213,25 +190,25 @@ class LinearFunction(torch.autograd.Function):
                         device="cuda"
                     )
                 input_t = intermediate_memory["input-t"]
-                custom_transpose_2d(dst=input_t, src=input)
+                custom_transpose_2d(dst=input_t, src=input.contiguous())
 
                 if bfp_gemms["grad-w"] is None:
-                    if Config.is_fast:
+                    if BfpConfig.is_fast:
                         bfp_gemms["grad-w"] = FastBfpGemm(
                             grad_output_t.shape,
                             input_t.shape,
-                            use_stochastic_rounding=Config.w_st,
-                            use_flex_bfp=Config.use_flex_bfp,
+                            use_stochastic_rounding=BfpConfig.w_st,
+                            use_flex_bfp=BfpConfig.use_flex_bfp,
                             layer_index=global_id,
                             name=f"linear-{id}-grad-w")
                     else:
                         bfp_gemms["grad-w"] = BfpGemm(
                             grad_output_t.shape,
                             input_t.shape,
-                            use_stochastic_rounding=Config.w_st,
-                            use_multi_exp=Config.use_multi_exp,
-                            apply_thresholding=Config.w_thres,
-                            threshold=Config.threshold)
+                            use_stochastic_rounding=BfpConfig.w_st,
+                            use_multi_exp=BfpConfig.use_multi_exp,
+                            apply_thresholding=BfpConfig.w_thres,
+                            threshold=BfpConfig.threshold)
 
                 bfp_gemm = bfp_gemms["grad-w"]
                 grad_weight = bfp_gemm.run(grad_output_t, input_t)
@@ -239,8 +216,8 @@ class LinearFunction(torch.autograd.Function):
                 # if BfpConfig.should_log:
                 #     with open(f"{BfpConfig.log_path}/bwd-{global_id}-dW.npy", "wb") as f:
                 #         np.save(f, grad_weight.cpu().clone().detach().numpy(), allow_pickle=False)
-                if Config.should_log:
-                    with open(f"{Config.log_path}/bwd-{global_id}-dW.npy", "wb") as f:
+                if BfpConfig.should_log:
+                    with open(f"{BfpConfig.log_path}/bwd-{global_id}-dW.npy", "wb") as f:
                         np.save(f, grad_weight.cpu().clone().detach().numpy(), allow_pickle=False)
 
             else:
@@ -248,14 +225,18 @@ class LinearFunction(torch.autograd.Function):
 
         if bias is not None and ctx.needs_input_grad[2]:
             grad_bias = grad_output.sum(0)
+            if BfpConfig.should_log:
+                with open(f"{BfpConfig.log_path}/bwd-{global_id}-dB.npy", "wb") as f:
+                    np.save(f, grad_bias.cpu().clone().detach().numpy(), allow_pickle=False)
+            
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None
 
 
 class CustomLinear(nn.Module):
     current_id = 0
 
-    def __init__(self, input_features, output_features, bias, precision_flag: PrecisionFlag, global_id: int, config = None):
+    def __init__(self, input_features, output_features, bias, precision_flag: PrecisionFlag, global_id: int, config=None):
         super(CustomLinear, self).__init__()
         self.id = CustomLinear.current_id
         CustomLinear.current_id += 1
@@ -294,13 +275,11 @@ class CustomLinear(nn.Module):
             "grad-output-t": None,
             "input-t": None
         }
-        
-        self.config = config
 
     def forward(self, input):
         # See the autograd section for explanation of what happens here.
         if self.precision_flag == PrecisionFlag.FP or self.precision_flag == PrecisionFlag.BFP:
-            return LinearFunction.apply(input, self.weight, self.bias, self.precision_flag, self.bfp_gemms, self.intermediate_memory, self.id, self.global_id, self.config)
+            return LinearFunction.apply(input, self.weight, self.bias, self.precision_flag, self.bfp_gemms, self.intermediate_memory, self.id, self.global_id)
         else:
             raise ValueError(f"not supported precision flag: {self.precision_flag}")
 
