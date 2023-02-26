@@ -40,17 +40,17 @@ The following steps describe methods of connecting the Transformers repository a
     - WARNING: only the single-GPU training script exists!
 
 ## Training
-To train transformer-based models, enter the following commands. 
+To train transformer-based models, enter the following commands. `train.py` supports single-sentence tasks while `train_pair.py` is for sentence-pair tasks. 
 ```bash
-python3 train.py --seed 1024 --gpu 0 --pad-option max_length --max-length 128 --batch_size 8 --learning_rate 1e-3 --config_path ./config/bert/config.json 
-python3 train_pair.py --seed 1024
+python train.py
+python train_pair.py --seed 1024
 ```
 For BFP-based training, the padding option should be set to 'max_length' due to the implementation details of the BFP module. The maximum length of the dataset varies, so the maximum length should be profiled before training. The training script supports CoLA, SST2, STSb, and MNLI of the GLUE Benchmark, but others are not approved yet. 
 
 ## Checking the Results
 The easiest way to summarize the results saved in the logs directory is using `extract_results.py`. You would have to change the `log_files` arguments on the script. The maximum epoch is set to 5 since we are focusing on the fine-tuning task. Like the training script, this extracting code only supports CoLA, SST2, STSb, and MNLI. 
 ```bash
-python3 extract_results.py
+python extract_results.py
 ```
 It will generate the best scores of the GLUE metric, as shown below. 
 ```python
