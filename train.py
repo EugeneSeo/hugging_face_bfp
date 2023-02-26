@@ -23,7 +23,7 @@ def set_reproducibility(random_seed):
     random.seed(random_seed)
     np.random.seed(random_seed)
     torch.cuda.manual_seed(random_seed)
-    torch.cuda.manual_seed_all(random_seed) # multi-GPU'
+    torch.cuda.manual_seed_all(random_seed) # multi-GPU
 
     # torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.deterministic = True
@@ -55,7 +55,6 @@ def get_project_name(args):
 
     dataset_type = args.dataset_type
     batch_size = f"global_batch{args.batch_size}"
-    # is_dist = "multi_gpus" if args.multiprocessing_distributed else "single_gpu"
     is_dist = "single_gpu"
     dataset_info = f"{dataset_type}-{batch_size}-{is_dist}"
 
